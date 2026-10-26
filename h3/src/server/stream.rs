@@ -9,6 +9,7 @@ use crate::{
     },
     quic::{self},
     shared_state::{ConnectionState, SharedState},
+    unbound::{Guard, Unbound},
 };
 
 use super::connection::RequestEnd;
@@ -131,6 +132,116 @@ where
     {
         self.inner.stream.is_0rtt()
     }
+
+    /// Waits until the client switched its sending side to unbound tunnel data
+    ///
+    /// Returns as soon as the client's `UNBOUND_DATA` frame arrives; from then on
+    /// [`RequestStream::recv_data`] yields plain tunnel bytes until the end of the stream.
+    /// Tunnel data which arrives in the meantime is not lost: it is kept for
+    /// [`RequestStream::into_unbound`], or returned by [`RequestStream::recv_data`] if the
+    /// stream is not handed over.
+    ///
+    /// Note that a client is never obliged to send `UNBOUND_DATA`, so this can wait for as long
+    /// as the tunnel lives. It also returns `Ok(())` when the client ends its sending side
+    /// without ever switching, because nothing more can arrive on that direction either;
+    /// [`RequestStream::is_recv_unbound`] tells the two outcomes apart.
+    ///
+    /// Fails immediately if this endpoint did not advertise
+    /// [`enable_unbound_data`](crate::server::builder::Builder::enable_unbound_data), since a
+    /// client which honours the draft will then never send the frame.
+    ///
+    /// See [the draft](https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/).
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn recv_unbound_data(&mut self) -> Result<(), StreamError> {
+        future::poll_fn(|cx| self.inner.poll_recv_unbound(cx)).await
+    }
+
+    /// Whether the client switched its sending side to unbound tunnel data
+    pub fn is_recv_unbound(&self) -> bool {
+        self.inner.is_recv_unbound()
+    }
+
+    /// Hands the receiving half of an unbound CONNECT stream back to the application
+    ///
+    /// Like [`RequestStream::into_unbound`], but for the receiving half of a
+    /// [`RequestStream::split`]: it waits for the client's `UNBOUND_DATA` and leaves this
+    /// endpoint's sending direction alone, so the sending half can keep writing `DATA` frames
+    /// through h3.
+    pub async fn into_unbound_recv(self) -> Result<Unbound<S>, StreamError> {
+        let Self { inner, request_end } = self;
+        let (prefix, stream, fin_received) = inner.into_unbound_recv().await?;
+
+        Ok(Unbound {
+            prefix,
+            stream,
+            guard: Guard::new(request_end),
+            fin_received,
+        })
+    }
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::SendStream<B> + quic::RecvStream,
+    B: Buf,
+{
+    /// Hands this CONNECT stream back to the application as a plain QUIC stream
+    ///
+    /// Switches this endpoint's sending side to unbound data if
+    /// [`RequestStream::send_unbound_data`] has not been called yet, waits for the client to do
+    /// the same, and then returns the stream itself: h3 stops framing, reading and writing it
+    /// altogether, and the application talks to the QUIC implementation directly. With
+    /// `h3-quinn`, [`Unbound::stream`] converts into `quinn::SendStream`/`quinn::RecvStream`.
+    ///
+    /// Two things to keep in mind:
+    ///
+    /// * [`Unbound::prefix`] holds tunnel data h3 had already read and must be written to the
+    ///   tunnel's other end before anything read from the stream.
+    /// * [`Unbound::guard`] keeps the connection's request bookkeeping alive and should be held
+    ///   for as long as the tunnel is in use.
+    ///
+    /// This takes the stream by value, so the stream is gone whichever way this ends: dropping
+    /// the returned future — a `select!` timeout, for instance — resets the request stream, and
+    /// so does an error, including
+    /// [`StreamError::UnboundDataNotNegotiated`](crate::error::StreamError::UnboundDataNotNegotiated).
+    /// Call [`RequestStream::send_unbound_data`] and [`RequestStream::recv_unbound_data`] first
+    /// if the wait needs to be cancellable, or if falling back to `DATA` frames when the client
+    /// does not support the extension matters.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use bytes::{Buf, Bytes};
+    /// # use h3::{quic, server::RequestStream};
+    /// # use http::{Method, Request, Response};
+    /// # async fn doc<S>(req: Request<()>, mut stream: RequestStream<S, Bytes>)
+    /// #     -> Result<(), Box<dyn std::error::Error>>
+    /// # where S: quic::SendStream<Bytes> + quic::RecvStream,
+    /// # {
+    /// if req.method() == Method::CONNECT {
+    ///     stream.send_response(Response::new(())).await?;
+    ///     let unbound = stream.into_unbound().await?;
+    ///     // `unbound.stream` is now the QUIC implementation's own stream; h3 is out of the way.
+    ///     // Write `unbound.prefix` to the tunnel first, then copy in both directions, and hold
+    ///     // on to `unbound.guard` until the tunnel is done.
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// See [the draft](https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/).
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn into_unbound(self) -> Result<Unbound<S>, StreamError> {
+        let Self { inner, request_end } = self;
+        let (prefix, stream, fin_received) = inner.into_unbound().await?;
+
+        Ok(Unbound {
+            prefix,
+            stream,
+            guard: Guard::new(request_end),
+            fin_received,
+        })
+    }
 }
 
 impl<S, B> RequestStream<S, B>
@@ -183,8 +294,34 @@ where
     }
 
     /// Send some data on the response body.
+    ///
+    /// Once [`RequestStream::send_unbound_data`] was called, the data is written without a `DATA`
+    /// frame header.
     pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {
         self.inner.send_data(buf).await
+    }
+
+    /// Stops framing the response body and switches to unbound tunnel data
+    ///
+    /// Sends an `UNBOUND_DATA` frame, after which every octet this endpoint writes is tunnel data
+    /// up to the QUIC FIN. [`RequestStream::send_data`] keeps working and writes the bytes with no
+    /// frame header, which is what makes this worthwhile for long-lived tunnels; trailers can no
+    /// longer be sent.
+    ///
+    /// Only CONNECT streams can be switched, and only if the client advertised
+    /// `SETTINGS_ENABLE_UNBOUND_DATA`. If it did not — including when its SETTINGS frame has not
+    /// arrived yet — this returns [`StreamError::UnboundDataNotNegotiated`] without writing
+    /// anything, so the response can simply continue in `DATA` frames.
+    ///
+    /// See [the draft](https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/).
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn send_unbound_data(&mut self) -> Result<(), StreamError> {
+        self.inner.send_unbound_data().await
+    }
+
+    /// Whether this endpoint switched its sending side to unbound tunnel data
+    pub fn is_send_unbound(&self) -> bool {
+        self.inner.is_send_unbound()
     }
 
     /// Stop a stream with an error code
@@ -219,6 +356,23 @@ where
     /// Returns the underlying stream id
     pub fn send_id(&self) -> StreamId {
         self.inner.stream.send_id()
+    }
+
+    /// Hands the sending half of an unbound CONNECT stream back to the application
+    ///
+    /// Like [`RequestStream::into_unbound`], but for the sending half of a
+    /// [`RequestStream::split`]: only this endpoint's direction has to be unbound, so the
+    /// receiving half can keep reading `DATA` frames through h3.
+    pub async fn into_unbound_send(self) -> Result<Unbound<S>, StreamError> {
+        let Self { inner, request_end } = self;
+        let (prefix, stream, fin_received) = inner.into_unbound_send().await?;
+
+        Ok(Unbound {
+            prefix,
+            stream,
+            guard: Guard::new(request_end),
+            fin_received,
+        })
     }
 }
 

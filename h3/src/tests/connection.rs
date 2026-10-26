@@ -606,6 +606,52 @@ async fn control_stream_frame_unexpected() {
 }
 
 #[tokio::test]
+async fn control_stream_unbound_data_unexpected() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+        let mut control_stream = connection.open_uni().await.unwrap();
+
+        // Send a Settings frame or we get a H3_MISSING_SETTINGS instead of H3_FRAME_UNEXPECTED
+        let mut buf = BytesMut::new();
+        StreamType::CONTROL.encode(&mut buf);
+        Frame::Settings::<Bytes>(Settings::default()).encode(&mut buf);
+        control_stream.write_all(&buf[..]).await.unwrap();
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4:
+        // The `UNBOUND_DATA` frame is only valid on CONNECT streams. If an endpoint receives an
+        // `UNBOUND_DATA` frame on a non-CONNECT stream, it must be treated as a connection error
+        // of type `H3_FRAME_UNEXPECTED`.
+        let mut buf = BytesMut::new();
+        Frame::<Bytes>::UnboundData.encode(&mut buf);
+        control_stream.write_all(&buf[..]).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        // This server advertises support, so the rejection can only come from the stream type.
+        let mut builder = server::builder();
+        builder.enable_unbound_data(true);
+        let mut incoming: server::Connection<_, Bytes> = builder.build(conn).await.unwrap();
+        assert_matches!(
+            incoming.accept().await.map(|_| ()).unwrap_err(),
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_FRAME_UNEXPECTED,
+                    ..
+                }
+            }
+        );
+    };
+
+    tokio::select! { _ = server_fut => (), _ = client_fut => panic!("client resolved first") };
+}
+
+#[tokio::test]
 async fn timeout_on_control_frame_read() {
     init_tracing();
     let mut pair = Pair::default();

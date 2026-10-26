@@ -60,6 +60,13 @@ pub enum Frame<B> {
     ///
     /// Conversely, when sending, send this frame and unwrap the stream
     WebTransportStream(SessionId),
+    /// Marks the end of framing on a CONNECT stream.
+    ///
+    /// Every octet which follows on that direction of the stream is tunneled data, up to the
+    /// QUIC FIN. The frame carries no payload.
+    ///
+    /// See draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.
+    UnboundData,
     Grease,
 }
 
@@ -101,6 +108,21 @@ impl Frame<PayloadLen> {
             return Ok(Frame::Data((len as usize).into()));
         }
 
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.1:
+        // The `UNBOUND_DATA` frame has no payload. The Length field of the frame MUST be zero.
+        // If a nonzero length is received, the endpoint must treat this as a connection error of
+        // type `H3_FRAME_ERROR`.
+        //
+        // Decoded before the `Incomplete` check below: the announced payload is never going to
+        // arrive, so waiting for it would stall the stream instead of failing the connection.
+        if ty == FrameType::UNBOUND_DATA {
+            return if len == 0 {
+                Ok(Frame::UnboundData)
+            } else {
+                Err(FrameError::InvalidFrameValue)
+            };
+        }
+
         if buf.remaining() < len as usize {
             return Err(FrameError::Incomplete(2 + len as usize));
         }
@@ -125,7 +147,9 @@ impl Frame<PayloadLen> {
             | FrameType::H2_PING
             | FrameType::H2_WINDOW_UPDATE
             | FrameType::H2_CONTINUATION => Err(FrameError::UnsupportedFrame(ty.0)),
-            FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA => unreachable!(),
+            FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA | FrameType::UNBOUND_DATA => {
+                unreachable!()
+            }
             _ => {
                 buf.advance(len as usize);
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
@@ -176,6 +200,13 @@ where
                 FrameType::WEBTRANSPORT_BI_STREAM.encode(buf);
                 id.encode(buf);
                 // rest of the data is sent streaming
+            }
+            Frame::UnboundData => {
+                FrameType::UNBOUND_DATA.encode(buf);
+                // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.1:
+                // The Length field of the frame MUST be zero.
+                buf.write_var(0);
+                // rest of the data is sent unframed
             }
         }
     }
@@ -235,6 +266,7 @@ impl fmt::Debug for Frame<PayloadLen> {
             Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
             Frame::Grease => write!(f, "Grease()"),
             Frame::WebTransportStream(session) => write!(f, "WebTransportStream({:?})", session),
+            Frame::UnboundData => write!(f, "UnboundData"),
         }
     }
 }
@@ -254,6 +286,7 @@ where
             Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
             Frame::Grease => write!(f, "Grease()"),
             Frame::WebTransportStream(_) => write!(f, "WebTransportStream()"),
+            Frame::UnboundData => write!(f, "UnboundData"),
         }
     }
 }
@@ -276,6 +309,7 @@ impl<T, U> PartialEq<Frame<T>> for Frame<U> {
             Frame::WebTransportStream(x) => {
                 matches!(other, Frame::WebTransportStream(y) if x == y)
             }
+            Frame::UnboundData => matches!(other, Frame::UnboundData),
         }
     }
 }
@@ -309,6 +343,8 @@ frame_types! {
     MAX_PUSH_ID = 0xD,
     // Reserved frame types
     WEBTRANSPORT_BI_STREAM = 0x41,
+    // draft-rosomakho-httpbis-h3-unbound-data-02, Section 7.2
+    UNBOUND_DATA = 0x2a937388,
 }
 
 impl FrameType {
@@ -406,7 +442,8 @@ impl SettingId {
                 | SettingId::ENABLE_CONNECT_PROTOCOL
                 | SettingId::ENABLE_WEBTRANSPORT
                 | SettingId::WEBTRANSPORT_MAX_SESSIONS
-                | SettingId::H3_DATAGRAM,
+                | SettingId::H3_DATAGRAM
+                | SettingId::ENABLE_UNBOUND_DATA,
         )
     }
 
@@ -455,9 +492,17 @@ setting_identifiers! {
     H3_SETTING_ENABLE_DATAGRAM_CHROME_SPECIFIC= 0xFFD277,
 
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
+
+    // draft-rosomakho-httpbis-h3-unbound-data-02, Section 7.1
+    ENABLE_UNBOUND_DATA = 0x282cf6bb,
 }
 
-const SETTINGS_LEN: usize = 8;
+/// How many settings a [`Settings`] can hold
+///
+/// Must be at least the number of identifiers [`SettingId::is_supported`] accepts, otherwise a
+/// legal SETTINGS frame from the peer can overflow it. Keep the slack small: the array is part of
+/// [`Frame`] and therefore of every `WriteBuf` on the send path.
+const SETTINGS_LEN: usize = 9;
 
 #[derive(Debug, PartialEq)]
 pub struct Settings {
@@ -539,6 +584,16 @@ impl Settings {
                 //# their receipt MUST be treated as a connection error of type
                 //# H3_SETTINGS_ERROR.
                 return Err(SettingsError::InvalidSettingId(identifier.0));
+            }
+
+            // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3:
+            // Valid values for `SETTINGS_ENABLE_UNBOUND_DATA` are 0 and 1. Receipt of different
+            // values must be treated as a connection error of type `H3_SETTINGS_ERROR`.
+            //
+            // RFC 9114 defines no such constraint for the booleans it registers, so the other
+            // boolean settings deliberately stay unvalidated here.
+            if identifier == SettingId::ENABLE_UNBOUND_DATA && value > 1 {
+                return Err(SettingsError::InvalidSettingValue(identifier, value));
             }
 
             if identifier.is_supported() {
@@ -657,40 +712,81 @@ mod tests {
         assert_eq!(check_frame, decoded);
     }
 
+    /// Builds a `Settings` from entries in order, so these tests do not have to spell out
+    /// `SETTINGS_LEN` filler entries.
+    fn settings(entries: &[(SettingId, u64)]) -> Settings {
+        let mut settings = Settings::default();
+        for (id, value) in entries {
+            settings.insert(*id, *value).unwrap();
+        }
+        settings
+    }
+
     #[test]
     fn settings_frame() {
         codec_frame_check(
-            Frame::Settings(Settings {
-                entries: [
-                    (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
-                    (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
-                    (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    (SettingId(95), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                ],
-                len: 4,
-            }),
+            Frame::Settings(settings(&[
+                (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
+                (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
+                (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
+                (SettingId(95), 0),
+            ])),
             &[
                 4, 18, 6, 128, 0, 250, 209, 1, 128, 0, 250, 210, 7, 128, 0, 250, 211, 64, 95, 0,
             ],
-            Frame::Settings(Settings {
-                entries: [
-                    (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
-                    (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
-                    (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    // check without the Grease setting because this is ignored
-                    (SettingId(0), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                ],
-                len: 3,
-            }),
+            // check without the Grease setting because this is ignored
+            Frame::Settings(settings(&[
+                (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
+                (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
+                (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
+            ])),
         );
+    }
+
+    #[test]
+    fn settings_frame_enable_unbound_data() {
+        codec_frame_check(
+            Frame::Settings(settings(&[(SettingId::ENABLE_UNBOUND_DATA, 1)])),
+            &[4, 5, 168, 44, 246, 187, 1],
+            Frame::Settings(settings(&[(SettingId::ENABLE_UNBOUND_DATA, 1)])),
+        );
+    }
+
+    #[test]
+    fn settings_frame_enable_unbound_data_invalid_value() {
+        let mut buf = Vec::new();
+        Frame::Settings::<Bytes>(settings(&[(SettingId::ENABLE_UNBOUND_DATA, 2)])).encode(&mut buf);
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3:
+        // Valid values for `SETTINGS_ENABLE_UNBOUND_DATA` are 0 and 1. Receipt of different
+        // values must be treated as a connection error of type `H3_SETTINGS_ERROR`.
+        let mut read = Cursor::new(&buf);
+        assert_matches!(
+            Frame::decode(&mut read),
+            Err(FrameError::Settings(SettingsError::InvalidSettingValue(
+                SettingId::ENABLE_UNBOUND_DATA,
+                2
+            )))
+        );
+    }
+
+    #[test]
+    fn unbound_data_frame() {
+        codec_frame_check(
+            Frame::UnboundData,
+            // 4-byte varint type 0x2a937388, then a zero length
+            &[0xaa, 0x93, 0x73, 0x88, 0],
+            Frame::UnboundData,
+        );
+    }
+
+    #[test]
+    fn unbound_data_frame_non_zero_length() {
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.1:
+        // If a nonzero length is received, the endpoint must treat this as a connection error of
+        // type `H3_FRAME_ERROR`.
+        let mut buf = Cursor::new(&[0xaa, 0x93, 0x73, 0x88, 1, 0]);
+        assert_matches!(Frame::decode(&mut buf), Err(FrameError::InvalidFrameValue));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::{convert::TryFrom, sync::Arc};
 
 use bytes::Buf;
-use http::{Request, StatusCode};
+use http::{Method, Request, StatusCode};
 
 #[cfg(feature = "tracing")]
 use tracing::instrument;
@@ -13,6 +13,7 @@ use crate::{
         internal_error::InternalConnectionError,
         Code, StreamError,
     },
+    ext::Protocol,
     frame::{FrameStream, FrameStreamError},
     proto::{
         frame::{Frame, PayloadLen},
@@ -243,6 +244,15 @@ where
         };
 
         //  request_stream.stop_stream(Code::H3_MESSAGE_ERROR).await;
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4:
+        // The `UNBOUND_DATA` frame is only valid on CONNECT streams.
+        //
+        // WebTransport sessions are excluded even though they use extended CONNECT: the session
+        // stream is driven by `h3-webtransport`, which expects its capsules in `DATA` frames.
+        if method == Method::CONNECT && protocol != Some(Protocol::WEB_TRANSPORT) {
+            self.request_stream.inner.set_unbound_capable();
+        }
 
         let mut req = http::Request::new(());
         *req.method_mut() = method;

@@ -14,6 +14,7 @@ use stream::WriteBuf;
 use tracing::{instrument, warn};
 
 use crate::{
+    buf::BufList,
     config::Config,
     error::{
         connection_error_creators::{
@@ -32,7 +33,10 @@ use crate::{
     qpack,
     quic::{self, RecvStream, SendStream, StreamErrorIncoming},
     shared_state::{ConnectionState, SharedState},
-    stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
+    stream::{
+        self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, RawPayload, UniStreamHeader,
+    },
+    unbound::Prefix,
     webtransport::SessionId,
 };
 
@@ -817,6 +821,22 @@ pub struct RequestStream<S, B> {
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
     send_grease_frame: bool,
+    /// Whether unbound data may be used on this stream
+    ///
+    /// Only CONNECT streams qualify; see
+    /// draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.
+    unbound_capable: bool,
+    /// Whether this endpoint sent `UNBOUND_DATA`, so its sending side carries raw tunnel data
+    send_unbound: bool,
+    /// Whether this stream owns the sending side of the QUIC stream
+    has_send: bool,
+    /// Whether this stream owns the receiving side of the QUIC stream
+    has_recv: bool,
+    /// Tunnel data received while waiting for the peer's `UNBOUND_DATA`
+    ///
+    /// Accumulating here rather than in a local keeps
+    /// [`Self::poll_recv_unbound`] usable from a cancelled future without losing data.
+    pending_prefix: BufList<Bytes>,
 }
 
 impl<S, B> RequestStream<S, B> {
@@ -833,7 +853,71 @@ impl<S, B> RequestStream<S, B> {
             max_field_section_size,
             trailers: None,
             send_grease_frame: grease,
+            unbound_capable: false,
+            send_unbound: false,
+            has_send: true,
+            has_recv: true,
+            pending_prefix: BufList::new(),
         }
+    }
+
+    /// Allows unbound data on this stream
+    ///
+    /// Called by h3 once it knows the stream carries a CONNECT request which may use unbound
+    /// data; see draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.
+    pub(crate) fn set_unbound_capable(&mut self) {
+        self.unbound_capable = true;
+    }
+
+    /// Whether this endpoint switched its sending side to unbound data
+    pub(crate) fn is_send_unbound(&self) -> bool {
+        self.send_unbound
+    }
+
+    /// Whether the peer switched its sending side to unbound data
+    pub(crate) fn is_recv_unbound(&self) -> bool {
+        self.stream.recv_unbound()
+    }
+
+    /// Takes the transport stream out of h3, together with the tunnel data h3 already read
+    fn take_unbound_parts(self) -> (Prefix, S, bool) {
+        let mut prefix = self.pending_prefix;
+        let (buffered, fin_received, stream) = self.stream.into_inner().into_parts();
+        // Data read while waiting for `UNBOUND_DATA` comes first, then whatever arrived in the
+        // same chunks as the frame itself.
+        prefix.append(buffered);
+        (Prefix::new(prefix), stream, fin_received)
+    }
+
+    /// Checks whether a received `UNBOUND_DATA` frame is acceptable on this stream
+    fn check_recv_unbound_allowed(&mut self) -> Result<(), StreamError> {
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3:
+        // Receiving `UNBOUND_DATA` without advertising support must be treated as a connection
+        // error of type `H3_FRAME_UNEXPECTED`.
+        if !self.local_settings().enable_unbound_data() {
+            return Err(
+                self.handle_connection_error_on_stream(InternalConnectionError::new(
+                    Code::H3_FRAME_UNEXPECTED,
+                    "received UNBOUND_DATA without advertising SETTINGS_ENABLE_UNBOUND_DATA"
+                        .to_string(),
+                )),
+            );
+        }
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4:
+        // The `UNBOUND_DATA` frame is only valid on CONNECT streams. If an endpoint receives an
+        // `UNBOUND_DATA` frame on a non-CONNECT stream, it must be treated as a connection error
+        // of type `H3_FRAME_UNEXPECTED`.
+        if !self.unbound_capable {
+            return Err(
+                self.handle_connection_error_on_stream(InternalConnectionError::new(
+                    Code::H3_FRAME_UNEXPECTED,
+                    "received UNBOUND_DATA on a stream which cannot carry unbound data".to_string(),
+                )),
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -869,6 +953,15 @@ where
                     return Poll::Ready(Ok(None));
                 }
                 Ok(Some(Frame::Data { .. })) => (),
+                Ok(Some(Frame::UnboundData)) => {
+                    // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2:
+                    // All remaining octets on the stream, up to the QUIC FIN, are interpreted as
+                    // data. `poll_data` below now streams them until the end of the stream, so
+                    // callers of `recv_data` keep working without seeing the switch.
+                    if let Err(error) = self.check_recv_unbound_allowed() {
+                        return Poll::Ready(Err(error));
+                    }
+                }
                 Ok(Some(other_frame)) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
@@ -908,12 +1001,122 @@ where
             .map_err(|error| self.handle_frame_stream_error_on_request_stream(error))
     }
 
+    /// Waits until the peer switched its sending side to unbound data
+    ///
+    /// Tunnel data received in the meantime — from `DATA` frames which precede `UNBOUND_DATA`, or
+    /// from the chunks which carry the frame itself — is buffered and handed over by
+    /// [`Self::take_unbound_parts`], so polling this is lossless even if the caller's future is
+    /// dropped.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub(crate) fn poll_recv_unbound(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StreamError>> {
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3:
+        // Endpoints MUST NOT send an `UNBOUND_DATA` frame to a peer that has not advertised
+        // `SETTINGS_ENABLE_UNBOUND_DATA` with value 1.
+        //
+        // A peer which honours that will never switch, so waiting for it would block until the
+        // stream ends. Fail immediately instead.
+        if !self.stream.recv_unbound() && !self.local_settings().enable_unbound_data() {
+            return Poll::Ready(Err(StreamError::StreamError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "cannot receive unbound data without advertising \
+                         SETTINGS_ENABLE_UNBOUND_DATA"
+                    .to_string(),
+            }));
+        }
+
+        loop {
+            if self.stream.recv_unbound() {
+                return Poll::Ready(Ok(()));
+            }
+
+            // draft-rosomakho-httpbis-h3-unbound-data-02, Section 5:
+            // Regular `DATA` frames may be sent prior to `UNBOUND_DATA`.
+            if self.stream.has_data() {
+                match ready!(self.stream.poll_data(cx)) {
+                    Ok(Some(mut data)) => {
+                        if data.has_remaining() {
+                            self.pending_prefix.push_bytes(&mut data);
+                        }
+                    }
+                    // A fully read frame clears the payload state, so this can only mean the
+                    // stream ended in the middle of a `DATA` frame. Polling the exhausted
+                    // payload again would spin, and the frame is truncated anyway, which
+                    // RFC 9114, Section 7.1 requires to be an H3_FRAME_ERROR connection error.
+                    Ok(None) => {
+                        return Poll::Ready(Err(self.handle_frame_stream_error_on_request_stream(
+                            FrameStreamError::UnexpectedEnd,
+                        )))
+                    }
+                    Err(error) => {
+                        return Poll::Ready(Err(
+                            self.handle_frame_stream_error_on_request_stream(error)
+                        ))
+                    }
+                }
+                continue;
+            }
+
+            match ready!(self.stream.poll_next(cx)) {
+                Ok(Some(Frame::UnboundData)) => {
+                    if let Err(error) = self.check_recv_unbound_allowed() {
+                        return Poll::Ready(Err(error));
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                // Read the payload on the next turn of the loop.
+                Ok(Some(Frame::Data { .. })) => (),
+                // The peer ended its sending side without switching. Nothing more can arrive on
+                // this direction, so there is nothing left for h3 to frame either: hand the
+                // stream over with `fin_received` set rather than tearing it down, as the
+                // sending side may well still be in use.
+                Ok(None) => return Poll::Ready(Ok(())),
+                Ok(Some(Frame::Headers(_))) => {
+                    // Trailers end the message, so the peer can no longer switch to unbound
+                    // data; CONNECT streams are not supposed to carry them in the first place
+                    // (RFC 9114, Section 4.4). Tell the peer to stop, as the stream is of no
+                    // further use to us.
+                    self.stop_sending(Code::H3_MESSAGE_ERROR);
+                    return Poll::Ready(Err(StreamError::StreamError {
+                        code: Code::H3_MESSAGE_ERROR,
+                        reason: "received trailers while waiting for UNBOUND_DATA".to_string(),
+                    }));
+                }
+                Ok(Some(other_frame)) => {
+                    // RFC 9114, Section 4.1: receipt of an invalid sequence of frames is a
+                    // connection error of type H3_FRAME_UNEXPECTED.
+                    return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError::new(
+                            Code::H3_FRAME_UNEXPECTED,
+                            format!("unexpected frame: {:?}", other_frame),
+                        ),
+                    )));
+                }
+                Err(error) => {
+                    return Poll::Ready(
+                        Err(self.handle_frame_stream_error_on_request_stream(error)),
+                    )
+                }
+            }
+        }
+    }
+
     /// Poll receive trailers.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_trailers(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2:
+        // No further HTTP/3 frames can be received on the stream, and CONNECT streams have no
+        // trailers to begin with. Without this, reading trailers after the tunnel ends would hit
+        // the "payload still pending" assertion in `FrameStream::poll_next`.
+        if self.stream.recv_unbound() {
+            return Poll::Ready(Ok(None));
+        }
+
         let mut trailers = if let Some(encoded) = self.trailers.take() {
             encoded
         } else {
@@ -1036,6 +1239,54 @@ where
     pub fn stop_sending(&mut self, err_code: Code) {
         self.stream.stop_sending(err_code);
     }
+
+    /// Hands the receiving side of an unbound CONNECT stream back to the application
+    ///
+    /// Waits for the peer's `UNBOUND_DATA` first. Only for a stream which no longer owns the
+    /// sending side, i.e. one half of a [`Self::split`].
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub(crate) async fn into_unbound_recv(mut self) -> Result<(Prefix, S, bool), StreamError> {
+        if self.has_send {
+            return Err(StreamError::StreamError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "this stream also owns the sending side, use into_unbound()".to_string(),
+            });
+        }
+
+        future::poll_fn(|cx| self.poll_recv_unbound(cx)).await?;
+
+        Ok(self.take_unbound_parts())
+    }
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::SendStream<B> + quic::RecvStream,
+    B: Buf,
+{
+    /// Hands an unbound CONNECT stream back to the application
+    ///
+    /// Switches this endpoint's sending side to unbound data if that has not happened yet, then
+    /// waits for the peer to do the same, because h3 can only stop framing a direction once the
+    /// peer stopped framing it too.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub(crate) async fn into_unbound(mut self) -> Result<(Prefix, S, bool), StreamError> {
+        // A split half only owns one direction, and `S` could implement both traits even then.
+        if !self.has_send || !self.has_recv {
+            return Err(StreamError::StreamError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "this stream owns a single direction, use into_unbound_send() or \
+                         into_unbound_recv()"
+                    .to_string(),
+            });
+        }
+
+        self.send_unbound_data().await?;
+        future::poll_fn(|cx| self.poll_recv_unbound(cx)).await?;
+        self.flush_send().await?;
+
+        Ok(self.take_unbound_parts())
+    }
 }
 
 impl<S, B> RequestStream<S, B>
@@ -1046,6 +1297,16 @@ where
     /// Send some data on the response body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {
+        if self.send_unbound {
+            // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2:
+            // All remaining octets on the stream, up to the QUIC FIN, are interpreted as data, so
+            // no `DATA` frame header is written.
+            stream::write(&mut self.stream, RawPayload(buf))
+                .await
+                .map_err(|e| self.handle_quic_stream_error(e))?;
+            return Ok(());
+        }
+
         let frame = Frame::Data(buf);
 
         stream::write(&mut self.stream, frame)
@@ -1054,9 +1315,66 @@ where
         Ok(())
     }
 
+    /// Stops framing this endpoint's sending side and switches it to unbound tunnel data
+    ///
+    /// Sends an `UNBOUND_DATA` frame, after which every octet written to the stream is tunnel
+    /// data up to the QUIC FIN. [`Self::send_data`] keeps working and writes the bytes without a
+    /// frame header; trailers can no longer be sent.
+    ///
+    /// Calling this again once the sending side is unbound does nothing.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub(crate) async fn send_unbound_data(&mut self) -> Result<(), StreamError> {
+        if self.send_unbound {
+            return Ok(());
+        }
+
+        if !self.unbound_capable {
+            return Err(StreamError::StreamError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "unbound data is only allowed on CONNECT streams".to_string(),
+            });
+        }
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3:
+        // Endpoints MUST NOT send an `UNBOUND_DATA` frame to a peer that has not advertised
+        // `SETTINGS_ENABLE_UNBOUND_DATA` with value 1.
+        //
+        // This is also what RFC 9114, Section 7.2.4.2 requires in general: do not send frames
+        // which are invalid based on the current understanding of the peer's settings.
+        if !self.settings().enable_unbound_data() {
+            return Err(StreamError::UnboundDataNotNegotiated);
+        }
+
+        // Written by hand rather than through `stream::write`, so that the flag is set as soon as
+        // the transport has taken the frame. Dropping this future during the flush below would
+        // otherwise leave the frame buffered for the next write while this side still believed it
+        // was framing, and the `DATA` header it then wrote would be read as tunnel data.
+        future::poll_fn(|cx| self.stream.poll_ready(cx))
+            .await
+            .map_err(|e| self.handle_quic_stream_error(e))?;
+        self.stream
+            .send_data(Frame::UnboundData)
+            .map_err(|e| self.handle_quic_stream_error(e))?;
+        self.send_unbound = true;
+        future::poll_fn(|cx| self.stream.poll_ready(cx))
+            .await
+            .map_err(|e| self.handle_quic_stream_error(e))?;
+
+        Ok(())
+    }
+
     /// Send a set of trailers to end the request.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2:
+        // After `UNBOUND_DATA`, the sender cannot send further HTTP/3 frames on the stream.
+        if self.send_unbound {
+            return Err(StreamError::StreamError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "trailers cannot be sent after UNBOUND_DATA".to_string(),
+            });
+        }
+
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
         //= type=TODO
         //# Characters in field names MUST be
@@ -1105,7 +1423,10 @@ where
     #[allow(missing_docs)]
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn finish(&mut self) -> Result<(), StreamError> {
-        if self.send_grease_frame {
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2:
+        // After `UNBOUND_DATA`, the sender cannot send further HTTP/3 frames on the stream. A
+        // grease frame here would be read by the peer as tunnel data.
+        if self.send_grease_frame && !self.send_unbound {
             // send a grease frame once per Connection
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
             //= type=implication
@@ -1122,6 +1443,39 @@ where
         future::poll_fn(|cx| self.stream.poll_finish(cx))
             .await
             .map_err(|e| self.handle_quic_stream_error(e))
+    }
+
+    /// Writes out whatever is still buffered on the sending side
+    ///
+    /// Needed before handing the stream over: a cancelled `send_data` can leave bytes with the
+    /// transport, and the application would otherwise write tunnel data in front of them.
+    async fn flush_send(&mut self) -> Result<(), StreamError> {
+        future::poll_fn(|cx| self.stream.poll_ready(cx))
+            .await
+            .map_err(|e| self.handle_quic_stream_error(e))
+    }
+
+    /// Hands the sending side of an unbound CONNECT stream back to the application
+    ///
+    /// Only for a stream which no longer owns the receiving side, i.e. one half of a
+    /// [`Self::split`].
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub(crate) async fn into_unbound_send(mut self) -> Result<(Prefix, S, bool), StreamError> {
+        if self.has_recv {
+            return Err(StreamError::StreamError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "this stream also owns the receiving side, use into_unbound()".to_string(),
+            });
+        }
+
+        self.send_unbound_data().await?;
+        self.flush_send().await?;
+
+        // This half owns no receiving side, so the end-of-stream flag it inherited from the
+        // split says nothing useful.
+        let (prefix, stream, _) = self.take_unbound_parts();
+
+        Ok((prefix, stream, false))
     }
 }
 
@@ -1146,6 +1500,11 @@ where
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
+                unbound_capable: self.unbound_capable,
+                send_unbound: self.send_unbound,
+                has_send: true,
+                has_recv: false,
+                pending_prefix: BufList::new(),
             },
             RequestStream {
                 stream: recv,
@@ -1153,6 +1512,11 @@ where
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
                 send_grease_frame: self.send_grease_frame,
+                unbound_capable: self.unbound_capable,
+                send_unbound: false,
+                has_send: false,
+                has_recv: true,
+                pending_prefix: self.pending_prefix,
             },
         )
     }

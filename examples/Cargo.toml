@@ -55,3 +55,7 @@ path = "server.rs"
 [[example]]
 name = "webtransport_server"
 path = "webtransport_server.rs"
+
+[[example]]
+name = "unbound_connect"
+path = "unbound_connect.rs"

@@ -19,12 +19,27 @@ use crate::{
     quic::{BidiStream, RecvStream, SendStream},
 };
 
+/// The payload which is currently being read from the stream
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Payload {
+    /// No payload is pending: a frame header is expected next
+    None,
+    /// The remaining length of the current `DATA` frame's payload
+    Bounded(usize),
+    /// A WebTransport bidirectional stream's payload, which runs until the end of the stream
+    WebTransport,
+    /// Tunnel data after an `UNBOUND_DATA` frame, which runs until the end of the stream
+    ///
+    /// See draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2.
+    UnboundData,
+}
+
 /// Decodes Frames from the underlying QUIC stream
 pub struct FrameStream<S, B> {
     pub stream: BufRecvStream<S, B>,
     // Already read data from the stream
     decoder: FrameDecoder,
-    remaining_data: usize,
+    payload: Payload,
 }
 
 impl<S, B> FrameStream<S, B> {
@@ -32,8 +47,16 @@ impl<S, B> FrameStream<S, B> {
         Self {
             stream,
             decoder: FrameDecoder::default(),
-            remaining_data: 0,
+            payload: Payload::None,
         }
+    }
+
+    /// Returns true if an `UNBOUND_DATA` frame was received on this stream
+    ///
+    /// Everything which follows on the receiving side is tunnel data, so no further frame can be
+    /// read from this stream.
+    pub(crate) fn recv_unbound(&self) -> bool {
+        matches!(self.payload, Payload::UnboundData)
     }
 
     /// Unwraps the Framed streamer and returns the underlying stream **without** data loss for
@@ -65,18 +88,35 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
         assert!(
-            self.remaining_data == 0,
+            self.payload == Payload::None,
             "There is still data to read, please call poll_data() until it returns None."
         );
 
         loop {
             match self.decoder.decode(self.stream.buf_mut())? {
                 Some(Frame::Data(PayloadLen(len))) => {
-                    self.remaining_data = len;
+                    // An empty `DATA` frame leaves nothing to read, so it must not put the
+                    // stream into a payload state: `poll_data` would then wait for bytes which
+                    // belong to the next frame.
+                    self.payload = match len {
+                        0 => Payload::None,
+                        len => Payload::Bounded(len),
+                    };
                     return Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))));
                 }
                 frame @ Some(Frame::WebTransportStream(_)) => {
-                    self.remaining_data = usize::MAX;
+                    self.payload = Payload::WebTransport;
+                    return Poll::Ready(Ok(frame));
+                }
+                frame @ Some(Frame::UnboundData) => {
+                    // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2:
+                    // All remaining octets on the stream, up to the QUIC FIN, are interpreted as
+                    // data. No further HTTP/3 frames (including `DATA`, `HEADERS`, or extension
+                    // frames) can be received on the stream.
+                    //
+                    // Whether the frame is acceptable at all is decided by the caller, which
+                    // knows if this is a CONNECT stream and whether we advertised support.
+                    self.payload = Payload::UnboundData;
                     return Poll::Ready(Ok(frame));
                 }
                 Some(frame) => return Poll::Ready(Ok(Some(frame))),
@@ -103,13 +143,16 @@ where
     /// Retrieves the next piece of data in an incoming data packet or webtransport stream
     ///
     ///
-    /// WebTransport bidirectional payload has no finite length and is processed until the end of the stream.
+    /// WebTransport bidirectional payload and unbound CONNECT data have no finite length and are
+    /// processed until the end of the stream.
     pub fn poll_data(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf>, FrameStreamError>> {
-        if self.remaining_data == 0 {
-            return Poll::Ready(Ok(None));
+        let limit = match self.payload {
+            Payload::None => return Poll::Ready(Ok(None)),
+            Payload::Bounded(remaining) => remaining,
+            Payload::WebTransport | Payload::UnboundData => usize::MAX,
         };
 
         let end = match self.try_recv(cx) {
@@ -117,19 +160,33 @@ where
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => false,
         };
-        let data = self.stream.buf_mut().take_chunk(self.remaining_data);
+        let data = self.stream.buf_mut().take_chunk(limit);
 
         match (data, end) {
-            (None, true) => Poll::Ready(Ok(None)),
-            (None, false) => Poll::Pending,
-            (Some(d), true)
-                if d.remaining() < self.remaining_data
-                    && !self.stream.buf_mut().has_remaining() =>
-            {
-                Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
+            (None, true) => {
+                // The stream ended with nothing buffered, so a `DATA` frame's announced payload
+                // will never arrive. Clear that state: a caller which drives `poll_data` while
+                // `has_data()` reports a pending payload would otherwise spin forever. The
+                // unbounded states stay, as they describe the stream rather than a frame.
+                if matches!(self.payload, Payload::Bounded(_)) {
+                    self.payload = Payload::None;
+                }
+                Poll::Ready(Ok(None))
             }
-            (Some(d), _) => {
-                self.remaining_data -= d.remaining();
+            (None, false) => Poll::Pending,
+            (Some(d), end) => {
+                // Only a `DATA` frame can be truncated: it announced a length. An unbounded
+                // payload ends wherever the stream ends, so reaching the end of the stream
+                // together with the last bytes is the expected case and must deliver them.
+                if let Payload::Bounded(remaining) = self.payload {
+                    if end && d.remaining() < remaining && !self.stream.buf_mut().has_remaining() {
+                        return Poll::Ready(Err(FrameStreamError::UnexpectedEnd));
+                    }
+                    self.payload = match remaining - d.remaining() {
+                        0 => Payload::None,
+                        left => Payload::Bounded(left),
+                    };
+                }
                 Poll::Ready(Ok(Some(d)))
             }
         }
@@ -141,7 +198,7 @@ where
     }
 
     pub(crate) fn has_data(&self) -> bool {
-        self.remaining_data != 0
+        self.payload != Payload::None
     }
 
     pub(crate) fn is_eos(&self) -> bool {
@@ -201,12 +258,12 @@ where
             FrameStream {
                 stream: send,
                 decoder: FrameDecoder::default(),
-                remaining_data: 0,
+                payload: Payload::None,
             },
             FrameStream {
                 stream: recv,
                 decoder: self.decoder,
-                remaining_data: self.remaining_data,
+                payload: self.payload,
             },
         )
     }
@@ -600,6 +657,80 @@ mod tests {
             |cx| to_bytes(stream.poll_data(cx)),
             Ok(Some(b)) if &*b == b"body"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_data_unbound_runs_to_the_end_of_the_stream() {
+        let mut recv = FakeRecv::default();
+        let mut buf = BytesMut::with_capacity(64);
+
+        // Everything up to and including the first tunnel bytes arrives in one chunk, which is
+        // what a CONNECT tunnel looks like in practice.
+        Frame::headers(&b"header"[..]).encode_with_payload(&mut buf);
+        Frame::<Bytes>::UnboundData.encode(&mut buf);
+        buf.put_slice(b"hello");
+        recv.chunk(buf.freeze());
+        // Bytes which would decode as a `DATA` frame header if framing had not been turned off.
+        recv.chunk(Bytes::from_static(&[0, 5, b'w', b'o', b'r', b'l', b'd']));
+
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::UnboundData)));
+        assert!(stream.recv_unbound());
+
+        assert_poll_matches!(
+            |cx| to_bytes(stream.poll_data(cx)),
+            Ok(Some(b)) if &*b == b"hello"
+        );
+        // The second chunk is delivered verbatim, even though the end of the stream is reached in
+        // the same poll: an unbound payload has no announced length, so this is not a truncated
+        // frame and the bytes must not be dropped.
+        assert_poll_matches!(
+            |cx| to_bytes(stream.poll_data(cx)),
+            Ok(Some(b)) if b == Bytes::from_static(&[0, 5, b'w', b'o', b'r', b'l', b'd'])
+        );
+        assert_poll_matches!(|cx| to_bytes(stream.poll_data(cx)), Ok(None));
+        assert!(stream.is_eos());
+    }
+
+    #[tokio::test]
+    async fn poll_data_clears_the_payload_state_at_the_end_of_the_stream() {
+        let mut recv = FakeRecv::default();
+        let mut buf = BytesMut::with_capacity(16);
+
+        // A `DATA` frame which announces four bytes and delivers none before the stream ends.
+        FrameType::DATA.encode(&mut buf);
+        VarInt::from(4u32).encode(&mut buf);
+        recv.chunk(buf.freeze());
+
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Ok(Some(Frame::Data(PayloadLen(4))))
+        );
+        assert!(stream.has_data());
+
+        assert_poll_matches!(|cx| to_bytes(stream.poll_data(cx)), Ok(None));
+        // The announced bytes can never arrive now, so the stream must stop reporting a pending
+        // payload: a caller which loops while `has_data()` holds would spin at 100% CPU.
+        assert!(!stream.has_data());
+    }
+
+    #[tokio::test]
+    async fn poll_data_unbound_ends_on_empty_stream_end() {
+        let mut recv = FakeRecv::default();
+        let mut buf = BytesMut::with_capacity(16);
+
+        Frame::<Bytes>::UnboundData.encode(&mut buf);
+        recv.chunk(buf.freeze());
+
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::UnboundData)));
+        // A tunnel which carries no data at all still ends cleanly.
+        assert_poll_matches!(|cx| to_bytes(stream.poll_data(cx)), Ok(None));
     }
 
     #[tokio::test]

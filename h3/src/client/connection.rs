@@ -8,7 +8,7 @@ use std::{
 
 use bytes::{Buf, BytesMut};
 use futures_util::future;
-use http::request;
+use http::{request, Method};
 
 #[cfg(feature = "tracing")]
 use tracing::{info, instrument, trace};
@@ -19,6 +19,7 @@ use crate::{
         connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
         ConnectionError, StreamError,
     },
+    ext::Protocol,
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
     qpack,
@@ -160,6 +161,14 @@ where
             extensions,
             ..
         } = parts;
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4:
+        // The `UNBOUND_DATA` frame is only valid on CONNECT streams.
+        //
+        // WebTransport sessions are excluded even though they use extended CONNECT: the session
+        // stream is driven by `h3-webtransport`, which expects its capsules in `DATA` frames.
+        let unbound_capable = method == Method::CONNECT
+            && extensions.get::<Protocol>() != Some(&Protocol::WEB_TRANSPORT);
+
         let headers = Header::request(method, uri, headers, extensions).map_err(|_e| {
             self.handle_connection_error_on_stream(InternalConnectionError {
                 code: Code::H3_INTERNAL_ERROR,
@@ -214,7 +223,7 @@ where
             .await
             .map_err(|e| self.handle_quic_stream_error(e))?;
 
-        let request_stream = RequestStream {
+        let mut request_stream = RequestStream {
             inner: connection::RequestStream::new(
                 FrameStream::new(BufRecvStream::new(stream)),
                 self.max_field_section_size,
@@ -222,6 +231,9 @@ where
                 self.send_grease_frame,
             ),
         };
+        if unbound_capable {
+            request_stream.inner.set_unbound_capable();
+        }
         // send the grease frame only once
         self.send_grease_frame = false;
         Ok(request_stream)

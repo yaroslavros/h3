@@ -133,6 +133,13 @@ pub enum StreamError {
         non_exhaustive
     )]
     RemoteClosing,
+    /// Unbound data cannot be sent because the peer did not advertise support for it
+    ///
+    /// The peer either set `SETTINGS_ENABLE_UNBOUND_DATA` to 0 or has not sent its SETTINGS frame
+    /// yet. Nothing was written to the stream, so the sender can keep using `DATA` frames.
+    ///
+    /// See [the draft](https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/).
+    UnboundDataNotNegotiated,
     /// Undefined error propagated by the quic layer
     #[cfg_attr(
         not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
@@ -197,6 +204,10 @@ impl std::fmt::Display for StreamError {
             ),
             StreamError::Undefined(err) => write!(f, "Undefined error: {}", err),
             StreamError::RemoteClosing => write!(f, "Remote is closing the connection"),
+            StreamError::UnboundDataNotNegotiated => write!(
+                f,
+                "Peer did not advertise SETTINGS_ENABLE_UNBOUND_DATA, unbound data cannot be sent"
+            ),
         }
     }
 }

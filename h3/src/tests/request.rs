@@ -1218,6 +1218,10 @@ fn invalid_request_frames() -> Vec<Frame<Bytes>> {
         Frame::Settings(frame::Settings::default()),
         Frame::Goaway(VarInt(1)),
         Frame::MaxPushId(PushId(1)),
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3:
+        // Receiving `UNBOUND_DATA` without advertising support must be treated as a connection
+        // error of type `H3_FRAME_UNEXPECTED`. These servers do not advertise it.
+        Frame::UnboundData,
     ]
 }
 
@@ -1405,6 +1409,56 @@ async fn request_invalid_data_frame_length_too_short() {
     .await;
 }
 
+#[tokio::test]
+async fn request_unbound_data_on_non_connect_stream() {
+    // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4:
+    // The `UNBOUND_DATA` frame is only valid on CONNECT streams. If an endpoint receives an
+    // `UNBOUND_DATA` frame on a non-CONNECT stream, it must be treated as a connection error of
+    // type `H3_FRAME_UNEXPECTED`.
+    //
+    // Unlike the `invalid_request_frames` cases, this server does advertise support, so the
+    // rejection can only come from the stream not being a CONNECT stream.
+    let mut builder = server::builder();
+    builder.enable_unbound_data(true);
+
+    request_sequence_check_with(
+        &builder,
+        |mut buf| {
+            request_encode(
+                &mut buf,
+                Request::post("http://localhost/salut").body(()).unwrap(),
+            );
+            Frame::<Bytes>::UnboundData.encode(&mut buf);
+        },
+        Some(Code::H3_FRAME_UNEXPECTED),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn request_unbound_data_non_zero_length() {
+    // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.1:
+    // The Length field of the frame MUST be zero. If a nonzero length is received, the endpoint
+    // must treat this as a connection error of type `H3_FRAME_ERROR`.
+    let mut builder = server::builder();
+    builder.enable_unbound_data(true);
+
+    request_sequence_check_with(
+        &builder,
+        |mut buf| {
+            request_encode(
+                &mut buf,
+                Request::connect("localhost:4433").body(()).unwrap(),
+            );
+            FrameType::UNBOUND_DATA.encode(&mut buf);
+            VarInt::from(1u32).encode(&mut buf);
+            buf.put_slice(b"x");
+        },
+        Some(Code::H3_FRAME_ERROR),
+    )
+    .await;
+}
+
 // Helpers
 
 fn request_encode<B: BufMut>(buf: &mut B, req: http::Request<()>) {
@@ -1463,6 +1517,16 @@ async fn request_sequence_check<F>(request: F, expected_error_code: Option<Code>
 where
     F: Fn(&mut BytesMut),
 {
+    request_sequence_check_with(&server::builder(), request, expected_error_code).await
+}
+
+async fn request_sequence_check_with<F>(
+    server_builder: &server::Builder,
+    request: F,
+    expected_error_code: Option<Code>,
+) where
+    F: Fn(&mut BytesMut),
+{
     init_tracing();
     let mut pair = Pair::default();
     let mut server = pair.server();
@@ -1514,7 +1578,7 @@ where
 
     let server_fut = async {
         let conn = server.next().await;
-        let mut incoming = server::Connection::new(conn).await.unwrap();
+        let mut incoming = server_builder.build(conn).await.unwrap();
         let request_resolver = incoming
             .accept()
             .await

@@ -22,6 +22,11 @@ impl<T: Buf> BufList<T> {
         self.bufs.push_back(buf);
     }
 
+    /// Moves all buffers of `other` to the back of this list
+    pub(crate) fn append(&mut self, other: Self) {
+        self.bufs.extend(other.bufs);
+    }
+
     pub fn cursor(&self) -> Cursor<'_, T> {
         Cursor {
             buf: self,

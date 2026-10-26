@@ -6,7 +6,7 @@
 use std::{
     convert::TryInto,
     future::Future,
-    pin::Pin,
+    pin::{pin, Pin},
     sync::Arc,
     task::{self, ready, Poll},
 };
@@ -25,8 +25,6 @@ use h3::{
     error::Code,
     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
-use tokio_util::sync::ReusableBoxFuture;
-
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -307,6 +305,39 @@ where
     }
 }
 
+impl<B> BidiStream<B>
+where
+    B: Buf,
+{
+    /// Returns the underlying quinn streams
+    ///
+    /// Useful once h3 has handed a stream back to the application, for instance after an
+    /// [unbound CONNECT] handoff: the application can then drive the tunnel with quinn's own API,
+    /// such as `tokio::io::copy_bidirectional`.
+    ///
+    /// Note that any data h3 had already read is *not* in the returned receive stream; on the
+    /// unbound data path it is returned as `h3::unbound::Unbound::prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` if data passed to
+    /// [`send_data`](h3::quic::SendStream::send_data) has not been flushed by
+    /// [`poll_ready`](h3::quic::SendStream::poll_ready) yet, because writing to the returned
+    /// stream would put the new bytes in front of it. h3's unbound data handoff flushes the
+    /// stream, so it does not hit this.
+    ///
+    /// [unbound CONNECT]: https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    // The error is the stream itself, which is the point: a failed conversion loses nothing.
+    #[allow(clippy::result_large_err)]
+    pub fn into_quinn(self) -> Result<(quinn::SendStream, quinn::RecvStream), Self> {
+        if self.send.writing.is_some() {
+            return Err(self);
+        }
+
+        Ok((self.send.stream, self.recv.stream))
+    }
+}
+
 impl<B: Buf> quic::RecvStream for BidiStream<B> {
     type Buf = Bytes;
 
@@ -376,20 +407,10 @@ where
 ///
 /// Implements a [`quic::RecvStream`] backed by a [`quinn::RecvStream`].
 pub struct RecvStream {
-    stream: Option<quinn::RecvStream>,
-    read_chunk_fut: ReadChunkFuture,
+    stream: quinn::RecvStream,
     id: StreamId,
     is_0rtt: bool,
-    pending_stop: Option<VarInt>,
 }
-
-type ReadChunkFuture = ReusableBoxFuture<
-    'static,
-    (
-        quinn::RecvStream,
-        Result<Option<quinn::Chunk>, quinn::ReadError>,
-    ),
->;
 
 impl RecvStream {
     fn new(stream: quinn::RecvStream) -> Self {
@@ -398,13 +419,23 @@ impl RecvStream {
             .expect("invalid stream id");
         let is_0rtt = stream.is_0rtt();
         Self {
-            stream: Some(stream),
-            // Should only allocate once the first time it's used
-            read_chunk_fut: ReusableBoxFuture::new(async { unreachable!() }),
+            stream,
             id,
             is_0rtt,
-            pending_stop: None,
         }
+    }
+
+    /// Returns the underlying [`quinn::RecvStream`]
+    ///
+    /// Useful once h3 has handed a stream back to the application, for instance after an
+    /// [unbound CONNECT] handoff: the application can then use quinn's own API on it.
+    ///
+    /// Note that any data h3 had already read is *not* in this stream; on the unbound data path
+    /// it is returned as `h3::unbound::Unbound::prefix`.
+    ///
+    /// [unbound CONNECT]: https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    pub fn into_quinn(self) -> quinn::RecvStream {
+        self.stream
     }
 }
 
@@ -416,18 +447,15 @@ impl quic::RecvStream for RecvStream {
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        if let Some(mut stream) = self.stream.take() {
-            self.read_chunk_fut.set(async move {
-                let chunk = stream.read_chunk(usize::MAX, true).await;
-                (stream, chunk)
-            })
-        };
+        // `read_chunk` is documented as cancel-safe, and quinn registers the waker on the
+        // connection rather than in the future, so the future can be created for each poll and
+        // dropped while it is still pending without losing data.
+        //
+        // Keeping ownership of the stream here — rather than moving it into a future which lives
+        // across polls — is what lets `recv_id`, `stop_sending` and `into_quinn` work at any
+        // time, including while a read is outstanding.
+        let chunk = ready!(pin!(self.stream.read_chunk(usize::MAX, true)).poll(cx));
 
-        let (mut stream, chunk) = ready!(self.read_chunk_fut.poll(cx));
-        if let Some(error_code) = self.pending_stop.take() {
-            let _ = stream.stop(error_code);
-        }
-        self.stream = Some(stream);
         Poll::Ready(Ok(chunk
             .map_err(convert_read_error_to_stream_error)?
             .map(|c| c.bytes)))
@@ -436,11 +464,7 @@ impl quic::RecvStream for RecvStream {
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn stop_sending(&mut self, error_code: u64) {
         let error_code = VarInt::from_u64(error_code).expect("invalid error_code");
-        if let Some(stream) = self.stream.as_mut() {
-            let _ = stream.stop(error_code);
-        } else {
-            self.pending_stop = Some(error_code);
-        }
+        let _ = self.stream.stop(error_code);
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
@@ -508,6 +532,30 @@ where
             stream,
             writing: None,
         }
+    }
+
+    /// Returns the underlying [`quinn::SendStream`]
+    ///
+    /// Useful once h3 has handed a stream back to the application, for instance after an
+    /// [unbound CONNECT] handoff: the application can then use quinn's own API on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` if data passed to
+    /// [`send_data`](h3::quic::SendStream::send_data) has not been flushed by
+    /// [`poll_ready`](h3::quic::SendStream::poll_ready) yet, because writing to the returned
+    /// stream would put the new bytes in front of it. h3's unbound data handoff flushes the
+    /// stream, so it does not hit this.
+    ///
+    /// [unbound CONNECT]: https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    // The error is the stream itself, which is the point: a failed conversion loses nothing.
+    #[allow(clippy::result_large_err)]
+    pub fn into_quinn(self) -> Result<quinn::SendStream, Self> {
+        if self.writing.is_some() {
+            return Err(self);
+        }
+
+        Ok(self.stream)
     }
 }
 

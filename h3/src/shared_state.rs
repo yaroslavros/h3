@@ -14,6 +14,8 @@ use crate::{config::Settings, error::internal_error::ErrorOrigin};
 pub struct SharedState {
     /// The settings, sent by the peer
     settings: OnceLock<Settings>,
+    /// The settings this endpoint advertised to the peer
+    local_settings: Settings,
     /// The connection error
     connection_error: OnceLock<ErrorOrigin>,
     /// The connection is closing
@@ -22,10 +24,21 @@ pub struct SharedState {
     waker: AtomicWaker,
 }
 
+impl SharedState {
+    /// Creates the shared state for a connection which advertised `local_settings`
+    pub fn new(local_settings: Settings) -> Self {
+        Self {
+            local_settings,
+            ..Default::default()
+        }
+    }
+}
+
 impl Default for SharedState {
     fn default() -> Self {
         Self {
             settings: OnceLock::new(),
+            local_settings: Settings::default(),
             connection_error: OnceLock::new(),
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
@@ -79,6 +92,13 @@ pub trait ConnectionState {
             .map(Cow::Borrowed)
             .unwrap_or_default()
     }
+    /// Get the settings this endpoint advertised to the peer
+    ///
+    /// As opposed to [`ConnectionState::settings`], which returns the peer's settings.
+    fn local_settings(&self) -> &Settings {
+        &self.shared_state().local_settings
+    }
+
     /// Set the connection to closing
     fn set_closing(&self) {
         self.shared_state()

@@ -344,6 +344,110 @@ pub(super) struct RequestEnd {
 }
 
 #[cfg(test)]
+mod unbound_tests {
+    use super::*;
+    use crate::tests::Pair;
+    use bytes::Bytes;
+    use http::{Request, Response};
+    use std::time::Duration;
+
+    /// h3 cannot see when a handed-off tunnel ends, so the request stays counted as in flight for
+    /// as long as the application holds the guard. Otherwise a graceful shutdown would consider
+    /// the connection idle and tear the tunnel down.
+    #[tokio::test]
+    async fn handed_off_tunnel_is_tracked_until_the_guard_is_dropped() {
+        let mut pair = Pair::default();
+        let mut server = pair.server();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+
+        let client = async {
+            let mut builder = crate::client::builder();
+            builder.enable_unbound_data(true);
+            let (mut driver, mut send_request) = builder
+                .build::<_, _, Bytes>(pair.client().await)
+                .await
+                .unwrap();
+
+            let request = async {
+                let mut stream = send_request
+                    .send_request(Request::connect("localhost:4433").body(()).unwrap())
+                    .await
+                    .unwrap();
+                stream.recv_response().await.unwrap();
+                while stream.send_unbound_data().await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                // Hold the tunnel open until the server is done inspecting its bookkeeping.
+                let _unbound = stream.into_unbound().await.unwrap();
+                let _ = done_rx.await;
+            };
+
+            tokio::select! {
+                _ = request => (),
+                _ = std::future::poll_fn(|cx| driver.poll_close(cx)) => (),
+            }
+        };
+
+        let server = async {
+            let mut builder = crate::server::builder();
+            builder.enable_unbound_data(true);
+            let mut incoming: Connection<_, Bytes> =
+                builder.build(server.next().await).await.unwrap();
+
+            let resolver = incoming.accept().await.unwrap().unwrap();
+            let (_, mut stream) = resolver.resolve_request().await.unwrap();
+            assert_eq!(incoming.ongoing_streams.len(), 1);
+
+            stream.send_response(Response::new(())).await.unwrap();
+
+            // Keep the control stream moving until the client's SETTINGS frame has been seen,
+            // otherwise there is no way to know whether it accepts UNBOUND_DATA.
+            for _ in 0..100 {
+                if incoming.settings().enable_unbound_data() {
+                    break;
+                }
+                let _ = poll_fn(|cx| Poll::Ready(incoming.poll_control(cx))).await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            stream.send_unbound_data().await.unwrap();
+
+            let unbound = stream.into_unbound().await.unwrap();
+
+            // The request is still in flight: the tunnel is live.
+            poll_fn(|cx| {
+                assert!(
+                    incoming.poll_requests_completion(cx).is_pending(),
+                    "handed-off tunnel was not counted as an ongoing request"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(incoming.ongoing_streams.len(), 1);
+
+            // Dropping the guard releases it.
+            drop(unbound);
+            poll_fn(|cx| {
+                let _ = incoming.poll_requests_completion(cx);
+                Poll::Ready(())
+            })
+            .await;
+            assert!(
+                incoming.ongoing_streams.is_empty(),
+                "the request was not released when the tunnel ended"
+            );
+
+            let _ = done_tx.send(());
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod cancellation_tests {
     use super::*;
     use crate::tests::Pair;

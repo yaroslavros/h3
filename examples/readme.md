@@ -49,6 +49,20 @@ Then run chromium and force it to use Quic.
 
 Now you can navigate to files in the `root` folder for example `https://localhost:4433/index.html`.
 
+## Unbound CONNECT tunnel
+The [unbound_connect](unbound_connect.rs) example needs no arguments: it runs a server and a
+client on loopback and tunnels a few bytes between them over a CONNECT stream.
+
+```bash
+> cargo run --example unbound_connect
+```
+
+Both endpoints negotiate [unbound data][unbound-data], send an `UNBOUND_DATA` frame once the
+tunnel is up and then take the QUIC stream out of `h3`, so the tunnel itself carries no HTTP/3
+framing at all. It is also a short read on how to use `into_unbound()`.
+
+[unbound-data]: https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+
 ## Debugging
 The example [example client](client.rs) can generate a `SSLKEYLOGFILE` to see the traffic unencrypted in tools like Wireshark.  
 To set this up just set the `SSLKEYLOGFILE` environment variable to a file path and follow this [tutorial](https://wiki.wireshark.org/TLS#using-the-pre-master-secret).

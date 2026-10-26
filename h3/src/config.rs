@@ -41,6 +41,10 @@ pub struct Settings {
     pub(crate) enable_datagram: bool,
     /// The maximum number of concurrent streams that can be opened by the peer.
     pub(crate) max_webtransport_sessions: u64,
+    /// Sets `SETTINGS_ENABLE_UNBOUND_DATA` if enabled
+    ///
+    /// See <https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/>
+    pub(crate) enable_unbound_data: bool,
 }
 
 impl From<&frame::Settings> for Settings {
@@ -65,6 +69,10 @@ impl From<&frame::Settings> for Settings {
                 .get(frame::SettingId::ENABLE_CONNECT_PROTOCOL)
                 .map(|value| value != 0)
                 .unwrap_or(defaults.enable_extended_connect),
+            enable_unbound_data: settings
+                .get(frame::SettingId::ENABLE_UNBOUND_DATA)
+                .map(|value| value != 0)
+                .unwrap_or(defaults.enable_unbound_data),
         }
     }
 }
@@ -85,6 +93,7 @@ impl TryFrom<Config> for frame::Settings {
                     enable_extended_connect,
                     enable_datagram,
                     max_webtransport_sessions,
+                    enable_unbound_data,
                 },
         } = value;
 
@@ -130,6 +139,14 @@ impl TryFrom<Config> for frame::Settings {
             max_webtransport_sessions,
         )?;
 
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3:
+        // Endpoints indicate support for unbound data transmission by sending the
+        // `SETTINGS_ENABLE_UNBOUND_DATA` setting with a value of 1.
+        settings.insert(
+            frame::SettingId::ENABLE_UNBOUND_DATA,
+            enable_unbound_data as u64,
+        )?;
+
         Ok(settings)
     }
 }
@@ -142,6 +159,7 @@ impl Default for Settings {
             enable_extended_connect: false,
             enable_datagram: false,
             max_webtransport_sessions: 0,
+            enable_unbound_data: false,
         }
     }
 }
@@ -164,6 +182,15 @@ impl Settings {
     /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies that an endpoint supports extended CONNECT.
     pub fn enable_extended_connect(&self) -> bool {
         self.enable_extended_connect
+    }
+
+    /// Indicates that `UNBOUND_DATA` frames may be received on CONNECT streams
+    ///
+    /// See [the draft](https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/)
+    /// for details. The parameter is directional: this is the sender's statement about what it is
+    /// willing to receive.
+    pub fn enable_unbound_data(&self) -> bool {
+        self.enable_unbound_data
     }
 }
 

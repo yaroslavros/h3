@@ -62,13 +62,45 @@ pub struct WriteBuf<B> {
     buf: [u8; WRITE_BUF_ENCODE_SIZE],
     len: usize,
     pos: usize,
-    frame: Option<Frame<B>>,
+    payload: Option<Payload<B>>,
 }
+
+/// What follows the encoded header of a [`WriteBuf`], if anything
+enum Payload<B> {
+    /// A frame, whose header was encoded into [`WriteBuf::buf`]
+    Frame(Frame<B>),
+    /// Bytes which are sent as they are, with no frame header
+    ///
+    /// Used for tunnel data after an `UNBOUND_DATA` frame; see
+    /// draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2.
+    Raw(B),
+}
+
+/// Wraps a buffer which is transmitted without a frame header
+///
+/// This is how unbound CONNECT data is written: the sending side of the stream carries plain
+/// tunnel bytes once `UNBOUND_DATA` has been sent.
+pub struct RawPayload<B>(pub B);
 
 impl<B> WriteBuf<B>
 where
     B: Buf,
 {
+    /// The payload which follows the encoded header
+    fn payload(&self) -> Option<&dyn Buf> {
+        match self.payload.as_ref()? {
+            Payload::Frame(frame) => frame.payload(),
+            Payload::Raw(buf) => Some(buf),
+        }
+    }
+
+    fn payload_mut(&mut self) -> Option<&mut dyn Buf> {
+        match self.payload.as_mut()? {
+            Payload::Frame(frame) => frame.payload_mut(),
+            Payload::Raw(buf) => Some(buf),
+        }
+    }
+
     fn encode_stream_type(&mut self, ty: StreamType) {
         let mut buf_mut = &mut self.buf[self.len..];
 
@@ -83,7 +115,7 @@ where
     }
 
     fn encode_frame_header(&mut self) {
-        if let Some(frame) = self.frame.as_ref() {
+        if let Some(Payload::Frame(frame)) = self.payload.as_ref() {
             let mut buf_mut = &mut self.buf[self.len..];
             frame.encode(&mut buf_mut);
             self.len = WRITE_BUF_ENCODE_SIZE - buf_mut.remaining_mut();
@@ -100,7 +132,7 @@ where
             buf: [0; WRITE_BUF_ENCODE_SIZE],
             len: 0,
             pos: 0,
-            frame: None,
+            payload: None,
         };
         me.encode_stream_type(ty);
         me
@@ -116,7 +148,7 @@ where
             buf: [0; WRITE_BUF_ENCODE_SIZE],
             len: 0,
             pos: 0,
-            frame: None,
+            payload: None,
         };
 
         this.encode_value(header);
@@ -161,7 +193,7 @@ where
             buf: [0; WRITE_BUF_ENCODE_SIZE],
             len: 0,
             pos: 0,
-            frame: None,
+            payload: None,
         };
 
         this.encode_value(header);
@@ -193,7 +225,7 @@ where
             buf: [0; WRITE_BUF_ENCODE_SIZE],
             len: 0,
             pos: 0,
-            frame: Some(frame),
+            payload: Some(Payload::Frame(frame)),
         };
         me.encode_frame_header();
         me
@@ -210,11 +242,25 @@ where
             buf: [0; WRITE_BUF_ENCODE_SIZE],
             len: 0,
             pos: 0,
-            frame: Some(frame),
+            payload: Some(Payload::Frame(frame)),
         };
         me.encode_value(ty);
         me.encode_frame_header();
         me
+    }
+}
+
+impl<B> From<RawPayload<B>> for WriteBuf<B>
+where
+    B: Buf,
+{
+    fn from(raw: RawPayload<B>) -> Self {
+        Self {
+            buf: [0; WRITE_BUF_ENCODE_SIZE],
+            len: 0,
+            pos: 0,
+            payload: Some(Payload::Raw(raw.0)),
+        }
     }
 }
 
@@ -223,18 +269,13 @@ where
     B: Buf,
 {
     fn remaining(&self) -> usize {
-        self.len - self.pos
-            + self
-                .frame
-                .as_ref()
-                .and_then(|f| f.payload())
-                .map_or(0, |x| x.remaining())
+        self.len - self.pos + self.payload().map_or(0, |x| x.remaining())
     }
 
     fn chunk(&self) -> &[u8] {
         if self.len - self.pos > 0 {
             &self.buf[self.pos..self.len]
-        } else if let Some(payload) = self.frame.as_ref().and_then(|f| f.payload()) {
+        } else if let Some(payload) = self.payload() {
             payload.chunk()
         } else {
             &[]
@@ -249,7 +290,7 @@ where
             cnt -= advanced;
         }
 
-        if let Some(payload) = self.frame.as_mut().and_then(|f| f.payload_mut()) {
+        if let Some(payload) = self.payload_mut() {
             payload.advance(cnt);
         }
     }
@@ -442,6 +483,15 @@ impl<S, B> BufRecvStream<S, B> {
             stream,
             _marker: PhantomData,
         }
+    }
+
+    /// Splits this wrapper into the bytes it has buffered, whether the end of the stream was
+    /// already seen, and the underlying stream
+    ///
+    /// Used to hand a stream back to the application: the buffered bytes have already been read
+    /// from the transport, so they would be lost if only the stream were returned.
+    pub(crate) fn into_parts(self) -> (BufList<Bytes>, bool, S) {
+        (self.buf, self.eos, self.stream)
     }
 }
 
@@ -743,6 +793,39 @@ mod tests {
 
         let id = w.get_var().unwrap();
         println!("Got id: {id}");
+    }
+
+    /// The control stream's SETTINGS frame is encoded into a fixed-size stack buffer, which
+    /// panics if it does not fit. Keep an eye on that budget as settings are added.
+    #[test]
+    fn write_buf_fits_a_maximal_settings_frame() {
+        use crate::config::Config;
+        use crate::proto::frame::Settings;
+        use std::convert::TryFrom;
+
+        // Spelled out so that adding a setting has to be reflected here.
+        let config = Config {
+            send_grease: true,
+            settings: crate::config::Settings {
+                max_field_section_size: VarInt::MAX.0,
+                max_webtransport_sessions: VarInt::MAX.0,
+                enable_webtransport: true,
+                enable_extended_connect: true,
+                enable_datagram: true,
+                enable_unbound_data: true,
+            },
+            ..Default::default()
+        };
+
+        let settings = Settings::try_from(config).expect("settings from config");
+        let encoded = WriteBuf::<Bytes>::from(UniStreamHeader::Control(settings));
+
+        assert!(
+            encoded.remaining() <= WRITE_BUF_ENCODE_SIZE,
+            "encoded control stream header does not fit the stack buffer: {} > {}",
+            encoded.remaining(),
+            WRITE_BUF_ENCODE_SIZE
+        );
     }
 
     #[test]

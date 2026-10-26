@@ -117,6 +117,19 @@ impl Builder {
         self.config.settings.enable_datagram = value;
         self
     }
+
+    /// Indicates to the peer that `UNBOUND_DATA` frames may be sent on CONNECT streams
+    ///
+    /// This only advertises what this endpoint is willing to *receive*; whether the peer accepts
+    /// `UNBOUND_DATA` is decided by its own setting, which
+    /// [`RequestStream::send_unbound_data`](crate::server::RequestStream::send_unbound_data)
+    /// checks.
+    ///
+    /// See: <https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/>
+    pub fn enable_unbound_data(&mut self, value: bool) -> &mut Self {
+        self.config.settings.enable_unbound_data = value;
+        self
+    }
 }
 
 impl Builder {
@@ -129,7 +142,7 @@ impl Builder {
         B: Buf,
     {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let shared = SharedState::default();
+        let shared = SharedState::new(self.config.settings);
 
         Ok(Connection {
             inner: ConnectionInner::new(conn, Arc::new(shared), self.config).await?,

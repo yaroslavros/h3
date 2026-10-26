@@ -22,6 +22,8 @@ pub use shared_state::{ConnectionState, SharedState};
 
 pub mod error;
 
+pub mod unbound;
+
 #[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
 #[allow(missing_docs)]
 pub mod connection;
